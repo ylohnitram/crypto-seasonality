@@ -2,16 +2,13 @@
 
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { AlertCircle, RefreshCw, Database, Info } from "lucide-react"
-import { MonthlyReturnsChart } from "@/components/monthly-returns-chart"
-import { SeasonalHeatmap } from "@/components/seasonal-heatmap"
-import { DataStatus } from "@/components/data-status"
-import { DbConfig } from "@/components/db-config"
+import { ProcessingStatus } from "@/components/processing-status"
 import { processSeasonalityData } from "@/lib/data-processing"
+// Remove the DbConfig import that's causing issues
+// import { DbConfig } from "@/components/db-config"
 
 export default function Home() {
   const [symbols, setSymbols] = useState<string[]>([])
@@ -365,11 +362,24 @@ export default function Home() {
               <AlertCircle className="h-16 w-16 mx-auto mb-4 text-amber-500" />
               <h2 className="text-xl font-semibold mb-2">Database Configuration Required</h2>
               <p className="text-muted-foreground mb-6 max-w-md mx-auto">
-                The application detected an invalid database URL. Please provide a valid Neon database URL to continue.
+                The application detected an invalid database URL. Please check your environment variables and make sure
+                DATABASE_URL is properly set in your Vercel project settings.
               </p>
-            </div>
 
-            <DbConfig onConfigured={handleDbConfigured} />
+              <Alert className="mb-6 max-w-md mx-auto">
+                <Info className="h-4 w-4" />
+                <AlertTitle>Configuration Instructions</AlertTitle>
+                <AlertDescription>
+                  Go to your Vercel project settings, navigate to the Environment Variables section, and add your Neon
+                  PostgreSQL connection string as DATABASE_URL.
+                </AlertDescription>
+              </Alert>
+
+              <Button onClick={() => window.location.reload()} className="flex items-center gap-2 mx-auto">
+                <RefreshCw className="h-4 w-4" />
+                Reload Application
+              </Button>
+            </div>
           </CardContent>
         </Card>
       </main>
@@ -453,6 +463,9 @@ export default function Home() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Přidáme komponentu pro zobrazení stavu zpracování dat */}
+        <ProcessingStatus />
       </main>
     )
   }
@@ -491,70 +504,19 @@ export default function Home() {
             </Alert>
           )}
 
-          <div className="grid gap-6 md:grid-cols-3">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Select Symbol</label>
-              <Select value={selectedSymbol} onValueChange={handleSymbolChange} disabled={loading}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Select symbol" />
-                </SelectTrigger>
-                <SelectContent>
-                  {symbols.map((symbol) => (
-                    <SelectItem key={symbol} value={symbol}>
-                      {symbol}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2 md:col-span-2 flex items-end justify-between">
-              {selectedSymbol && <DataStatus symbol={selectedSymbol} />}
-              <Button
-                variant="outline"
-                onClick={handleRefresh}
-                disabled={refreshing || loading}
-                className="flex items-center gap-2"
-              >
-                <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-                {refreshing ? "Updating Data..." : "Update All Data"}
-              </Button>
-            </div>
+          <div className="text-center py-8">
+            <Button size="lg" onClick={handleRefresh} disabled={refreshing} className="flex items-center gap-2 mx-auto">
+              <RefreshCw className={`h-5 w-5 ${refreshing ? "animate-spin" : ""}`} />
+              {refreshing ? "Updating Data..." : "Update Cryptocurrency Data"}
+            </Button>
           </div>
         </CardContent>
       </Card>
 
-      <Card>
-        <Tabs value={view} onValueChange={setView}>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <CardTitle>Monthly Returns (Historical Data Only)</CardTitle>
-              <TabsList className="grid w-[400px] grid-cols-2">
-                <TabsTrigger value="barchart">Bar Chart</TabsTrigger>
-                <TabsTrigger value="heatmap">Heatmap</TabsTrigger>
-              </TabsList>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {loading ? (
-              <div className="w-full h-[400px] flex items-center justify-center">
-                <div className="text-center">
-                  <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
-                  <p className="text-muted-foreground">Loading data...</p>
-                </div>
-              </div>
-            ) : (
-              <div className="w-full h-[500px]">
-                <TabsContent value="barchart" className="mt-0 h-full">
-                  <MonthlyReturnsChart data={monthlyReturns} />
-                </TabsContent>
-                <TabsContent value="heatmap" className="mt-0 h-full">
-                  <SeasonalHeatmap data={heatmapData} years={years} />
-                </TabsContent>
-              </div>
-            )}
-          </CardContent>
-        </Tabs>
-      </Card>
+      {/* Přidáme komponentu pro zobrazení stavu zpracování dat */}
+      <div className="mb-8">
+        <ProcessingStatus />
+      </div>
     </main>
   )
 }

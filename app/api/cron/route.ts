@@ -326,10 +326,149 @@ async function findDataGaps(symbol: string, startTimestamp: number, endTimestamp
   }
 }
 
+// Nová funkce pro získání stavu zpracování
+async function getProcessingState() {
+  try {
+    // Zkontrolujeme, zda tabulka processing_state existuje
+    const tableExists = await executeQuery(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public'
+        AND table_name = 'processing_state'
+      ) as table_exists
+    `)
+
+    if (!tableExists || !tableExists[0].table_exists) {
+      // Vytvoříme tabulku, pokud neexistuje
+      await executeQuery(`
+        CREATE TABLE processing_state (
+          id SERIAL PRIMARY KEY,
+          last_processed_symbol VARCHAR(20),
+          last_processed_index INTEGER,
+          total_symbols INTEGER,
+          is_processing BOOLEAN DEFAULT false,
+          started_at TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `)
+
+      // Vložíme výchozí záznam
+      await executeQuery(`
+        INSERT INTO processing_state 
+          (last_processed_symbol, last_processed_index, total_symbols, is_processing, started_at, updated_at) 
+        VALUES 
+          (NULL, -1, 0, false, NULL, CURRENT_TIMESTAMP)
+      `)
+
+      return {
+        lastProcessedSymbol: null,
+        lastProcessedIndex: -1,
+        totalSymbols: 0,
+        isProcessing: false,
+        startedAt: null,
+      }
+    }
+
+    // Získáme aktuální stav
+    const state = await executeQuery(`SELECT * FROM processing_state ORDER BY id DESC LIMIT 1`)
+
+    if (!state || state.length === 0) {
+      // Vložíme výchozí záznam, pokud žádný neexistuje
+      await executeQuery(`
+        INSERT INTO processing_state 
+          (last_processed_symbol, last_processed_index, total_symbols, is_processing, started_at, updated_at) 
+        VALUES 
+          (NULL, -1, 0, false, NULL, CURRENT_TIMESTAMP)
+      `)
+
+      return {
+        lastProcessedSymbol: null,
+        lastProcessedIndex: -1,
+        totalSymbols: 0,
+        isProcessing: false,
+        startedAt: null,
+      }
+    }
+
+    return {
+      lastProcessedSymbol: state[0].last_processed_symbol,
+      lastProcessedIndex: state[0].last_processed_index,
+      totalSymbols: state[0].total_symbols,
+      isProcessing: state[0].is_processing,
+      startedAt: state[0].started_at,
+    }
+  } catch (error) {
+    console.error("Error getting processing state:", error)
+    return {
+      lastProcessedSymbol: null,
+      lastProcessedIndex: -1,
+      totalSymbols: 0,
+      isProcessing: false,
+      startedAt: null,
+    }
+  }
+}
+
+// Nová funkce pro aktualizaci stavu zpracování
+async function updateProcessingState(state: {
+  lastProcessedSymbol: string | null
+  lastProcessedIndex: number
+  totalSymbols: number
+  isProcessing: boolean
+  startedAt: Date | null
+}) {
+  try {
+    await executeQuery(
+      `
+      UPDATE processing_state 
+      SET 
+        last_processed_symbol = $1,
+        last_processed_index = $2,
+        total_symbols = $3,
+        is_processing = $4,
+        started_at = $5,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = (SELECT id FROM processing_state ORDER BY id DESC LIMIT 1)
+    `,
+      [state.lastProcessedSymbol, state.lastProcessedIndex, state.totalSymbols, state.isProcessing, state.startedAt],
+    )
+  } catch (error) {
+    console.error("Error updating processing state:", error)
+  }
+}
+
 // Main cron job function
 export async function GET() {
   try {
     console.log("Starting data update process to fetch crypto data")
+
+    // Získáme aktuální stav zpracování
+    const processingState = await getProcessingState()
+
+    // Pokud již probíhá zpracování a začalo před méně než 10 minutami, vrátíme informaci o probíhajícím zpracování
+    if (processingState.isProcessing && processingState.startedAt) {
+      const startedAt = new Date(processingState.startedAt)
+      const now = new Date()
+      const diffMinutes = (now.getTime() - startedAt.getTime()) / (1000 * 60)
+
+      if (diffMinutes < 10) {
+        return NextResponse.json({
+          success: true,
+          message: "Data update is already in progress",
+          processingState,
+        })
+      } else {
+        // Pokud zpracování běží déle než 10 minut, předpokládáme, že se zaseklo a resetujeme stav
+        console.log("Processing has been running for more than 10 minutes, resetting state")
+      }
+    }
+
+    // Nastavíme stav na "zpracovává se"
+    await updateProcessingState({
+      ...processingState,
+      isProcessing: true,
+      startedAt: new Date(),
+    })
 
     // 1. Fetch all available perpetual futures from Binance
     console.log("Fetching available symbols from Binance...")
@@ -342,6 +481,14 @@ export async function GET() {
       exchangeInfo = await fetchWithRetry(exchangeInfoUrl, {}, 5, 2000)
     } catch (error) {
       console.error("Failed to fetch exchange info:", error)
+
+      // Resetujeme stav zpracování
+      await updateProcessingState({
+        ...processingState,
+        isProcessing: false,
+        startedAt: null,
+      })
+
       return NextResponse.json(
         {
           success: false,
@@ -428,6 +575,14 @@ export async function GET() {
           existingCandles = await executeQuery("SELECT COUNT(*) as count FROM daily_candles")
         } catch (retryError) {
           console.error("Error retrying to check existing candles:", retryError)
+
+          // Resetujeme stav zpracování
+          await updateProcessingState({
+            ...processingState,
+            isProcessing: false,
+            startedAt: null,
+          })
+
           return NextResponse.json(
             {
               success: false,
@@ -437,6 +592,13 @@ export async function GET() {
           )
         }
       } else {
+        // Resetujeme stav zpracování
+        await updateProcessingState({
+          ...processingState,
+          isProcessing: false,
+          startedAt: null,
+        })
+
         return NextResponse.json(
           {
             success: false,
@@ -469,204 +631,89 @@ export async function GET() {
     // Get current time for data fetching
     const currentTime = new Date().getTime()
 
-    // Process symbols in smaller batches with longer delays to avoid rate limiting
-    const batchSize = 1 // Snížím velikost dávky na 1 pro maximální spolehlivost
-    const batches = Math.ceil(symbolsToProcess.length / batchSize)
+    // Aktualizujeme stav zpracování s celkovým počtem symbolů
+    await updateProcessingState({
+      ...processingState,
+      totalSymbols: symbolsToProcess.length,
+      isProcessing: true,
+      startedAt: new Date(),
+    })
 
-    for (let batchIndex = 0; batchIndex < batches; batchIndex++) {
-      const batchStart = batchIndex * batchSize
-      const batchEnd = Math.min(batchStart + batchSize, symbolsToProcess.length)
-      const batchSymbols = symbolsToProcess.slice(batchStart, batchEnd)
+    // Určíme, od kterého indexu začít zpracování
+    let startIndex = 0
+    if (processingState.lastProcessedIndex >= 0 && processingState.lastProcessedIndex < symbolsToProcess.length - 1) {
+      startIndex = processingState.lastProcessedIndex + 1
+      console.log(`Resuming processing from index ${startIndex} (symbol: ${symbolsToProcess[startIndex].symbol})`)
+    }
 
-      console.log(
-        `Processing batch ${batchIndex + 1}/${batches} (${batchStart + 1}-${batchEnd} of ${symbolsToProcess.length})`,
-      )
+    // Process symbols one by one to avoid rate limiting and timeout issues
+    const maxSymbolsPerRun = 1 // Zpracujeme pouze jeden symbol na jedno spuštění
+    const endIndex = Math.min(startIndex + maxSymbolsPerRun, symbolsToProcess.length)
 
-      // Process symbols in this batch sequentially to avoid rate limiting
-      for (const symbol of batchSymbols) {
+    for (let i = startIndex; i < endIndex; i++) {
+      const symbol = symbolsToProcess[i]
+
+      console.log(`Processing symbol ${i + 1}/${symbolsToProcess.length}: ${symbol.symbol}`)
+
+      try {
+        console.log(`Checking data for ${symbol.symbol}`)
+
+        // Get the last timestamp for this symbol
+        let lastTimestamp
         try {
-          console.log(`Checking data for ${symbol.symbol}`)
+          const result = await executeQuery(
+            `SELECT MAX(timestamp) as last_timestamp FROM daily_candles WHERE symbol = $1`,
+            [symbol.symbol],
+          )
 
-          // Get the last timestamp for this symbol
-          let lastTimestamp
-          try {
-            const result = await executeQuery(
-              `SELECT MAX(timestamp) as last_timestamp FROM daily_candles WHERE symbol = $1`,
-              [symbol.symbol],
-            )
-
-            if (result && result.length > 0 && result[0].last_timestamp) {
-              lastTimestamp = Number(result[0].last_timestamp)
-            } else {
-              lastTimestamp = null
-            }
-          } catch (error) {
-            console.error(`Error getting last timestamp for ${symbol.symbol}:`, error)
-            lastTimestamp = null
-
-            // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-            if (error instanceof Error && error.message.includes("Rate limit")) {
-              console.log("Rate limit detected, waiting 15 seconds before continuing...")
-              await new Promise((resolve) => setTimeout(resolve, 15000))
-            }
-          }
-
-          if (isInitialSetup || lastTimestamp === null) {
-            // For initial setup or if no data exists, fetch historical data (last 2 years)
-            const startTime = new Date()
-            startTime.setFullYear(startTime.getFullYear() - 2)
-            const startTimestamp = startTime.getTime()
-
-            console.log(`Fetching historical data for ${symbol.symbol} since ${startTime.toISOString()}`)
-
-            // Změna: Použití správného endpointu pro získání svíček
-            const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${startTimestamp}&limit=500`
-
-            try {
-              const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
-
-              // Transform the data
-              const dailyCandles = data.map((kline: any[]) => ({
-                timestamp: kline[0], // Open time
-                open: kline[1],
-                high: kline[2],
-                low: kline[3],
-                close: kline[4],
-                volume: kline[5],
-                closeTime: kline[6],
-              }))
-
-              // Store daily candles in database - zpracovávám v menších dávkách
-              const candleBatchSize = 20 // Snížím velikost dávky na 20
-              for (let i = 0; i < dailyCandles.length; i += candleBatchSize) {
-                const candleBatch = dailyCandles.slice(i, i + candleBatchSize)
-
-                try {
-                  for (const candle of candleBatch) {
-                    try {
-                      await executeQuery(
-                        `INSERT INTO daily_candles 
-                          (symbol, timestamp, open, high, low, close, volume, close_time) 
-                         VALUES 
-                          ($1, $2, $3, $4, $5, $6, $7, $8)
-                         ON CONFLICT (symbol, timestamp) 
-                         DO UPDATE SET 
-                          open = $3, high = $4, low = $5, close = $6, volume = $7, close_time = $8`,
-                        [
-                          symbol.symbol,
-                          candle.timestamp,
-                          candle.open,
-                          candle.high,
-                          candle.low,
-                          candle.close,
-                          candle.volume,
-                          candle.closeTime,
-                        ],
-                      )
-                    } catch (candleError) {
-                      console.error(`Error storing candle for ${symbol.symbol}:`, candleError)
-
-                      // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                      if (candleError instanceof Error && candleError.message.includes("Rate limit")) {
-                        console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                        await new Promise((resolve) => setTimeout(resolve, 15000))
-                      }
-                    }
-
-                    // Krátká pauza mezi jednotlivými svíčkami
-                    await new Promise((resolve) => setTimeout(resolve, 100))
-                  }
-                } catch (batchError) {
-                  console.error(`Error storing candle batch for ${symbol.symbol}:`, batchError)
-
-                  // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                  if (batchError instanceof Error && batchError.message.includes("Rate limit")) {
-                    console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                    await new Promise((resolve) => setTimeout(resolve, 15000))
-                  }
-                }
-
-                // Krátká pauza mezi dávkami svíček
-                await new Promise((resolve) => setTimeout(resolve, 1000))
-              }
-
-              // Update monthly candles
-              try {
-                await processMonthlyCandles(symbol.symbol)
-              } catch (error) {
-                console.error(`Error processing monthly candles for ${symbol.symbol}:`, error)
-
-                // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                if (error instanceof Error && error.message.includes("Rate limit")) {
-                  console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                  await new Promise((resolve) => setTimeout(resolve, 15000))
-                }
-              }
-
-              successCount++
-            } catch (fetchError) {
-              console.error(`Error fetching data for ${symbol.symbol}:`, fetchError)
-              errorCount++
-            }
+          if (result && result.length > 0 && result[0].last_timestamp) {
+            lastTimestamp = Number(result[0].last_timestamp)
           } else {
-            // Check if the last data is recent (within the last 2 days)
-            const twoDaysAgo = currentTime - 2 * 24 * 60 * 60 * 1000
+            lastTimestamp = null
+          }
+        } catch (error) {
+          console.error(`Error getting last timestamp for ${symbol.symbol}:`, error)
+          lastTimestamp = null
 
-            if (lastTimestamp >= twoDaysAgo) {
-              console.log(
-                `Data for ${symbol.symbol} is up to date (last update: ${new Date(lastTimestamp).toISOString()})`,
-              )
-              skippedCount++
-              continue
-            }
+          // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+          if (error instanceof Error && error.message.includes("Rate limit")) {
+            console.log("Rate limit detected, waiting 15 seconds before continuing...")
+            await new Promise((resolve) => setTimeout(resolve, 15000))
+          }
+        }
 
-            // Check for gaps in the data
-            const twoYearsAgo = new Date()
-            twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2)
-            const twoYearsAgoTimestamp = twoYearsAgo.getTime()
+        if (isInitialSetup || lastTimestamp === null) {
+          // For initial setup or if no data exists, fetch historical data (last 2 years)
+          const startTime = new Date()
+          startTime.setFullYear(startTime.getFullYear() - 2)
+          const startTimestamp = startTime.getTime()
 
-            // Only look for gaps in the last 2 years
-            const startTimestamp = Math.max(twoYearsAgoTimestamp, lastTimestamp)
+          console.log(`Fetching historical data for ${symbol.symbol} since ${startTime.toISOString()}`)
 
-            let gaps = []
-            try {
-              gaps = await findDataGaps(symbol.symbol, startTimestamp, currentTime)
-            } catch (error) {
-              console.error(`Error finding data gaps for ${symbol.symbol}:`, error)
+          // Změna: Použití správného endpointu pro získání svíček
+          const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${startTimestamp}&limit=500`
 
-              // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-              if (error instanceof Error && error.message.includes("Rate limit")) {
-                console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                await new Promise((resolve) => setTimeout(resolve, 15000))
-              }
+          try {
+            const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
 
-              // Pokračujeme s prázdným seznamem mezer
-              gaps = []
-            }
+            // Transform the data
+            const dailyCandles = data.map((kline: any[]) => ({
+              timestamp: kline[0], // Open time
+              open: kline[1],
+              high: kline[2],
+              low: kline[3],
+              close: kline[4],
+              volume: kline[5],
+              closeTime: kline[6],
+            }))
 
-            if (gaps.length === 0) {
-              // No gaps, just fetch the latest data
-              console.log(`Fetching latest data for ${symbol.symbol} since ${new Date(lastTimestamp).toISOString()}`)
-
-              // Změna: Použití správného endpointu pro získání svíček
-              const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${lastTimestamp + 1}&limit=10`
+            // Store daily candles in database - zpracovávám v menších dávkách
+            const candleBatchSize = 20 // Snížím velikost dávky na 20
+            for (let i = 0; i < dailyCandles.length; i += candleBatchSize) {
+              const candleBatch = dailyCandles.slice(i, i + candleBatchSize)
 
               try {
-                const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
-
-                // Transform the data
-                const dailyCandles = data.map((kline: any[]) => ({
-                  timestamp: kline[0], // Open time
-                  open: kline[1],
-                  high: kline[2],
-                  low: kline[3],
-                  close: kline[4],
-                  volume: kline[5],
-                  closeTime: kline[6],
-                }))
-
-                // Store daily candles in database
-                for (const candle of dailyCandles) {
+                for (const candle of candleBatch) {
                   try {
                     await executeQuery(
                       `INSERT INTO daily_candles 
@@ -687,11 +734,11 @@ export async function GET() {
                         candle.closeTime,
                       ],
                     )
-                  } catch (error) {
-                    console.error(`Error storing candle for ${symbol.symbol}:`, error)
+                  } catch (candleError) {
+                    console.error(`Error storing candle for ${symbol.symbol}:`, candleError)
 
                     // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                    if (error instanceof Error && error.message.includes("Rate limit")) {
+                    if (candleError instanceof Error && candleError.message.includes("Rate limit")) {
                       console.log("Rate limit detected, waiting 15 seconds before continuing...")
                       await new Promise((resolve) => setTimeout(resolve, 15000))
                     }
@@ -700,12 +747,119 @@ export async function GET() {
                   // Krátká pauza mezi jednotlivými svíčkami
                   await new Promise((resolve) => setTimeout(resolve, 100))
                 }
+              } catch (batchError) {
+                console.error(`Error storing candle batch for ${symbol.symbol}:`, batchError)
 
-                // Update monthly candles
+                // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+                if (batchError instanceof Error && batchError.message.includes("Rate limit")) {
+                  console.log("Rate limit detected, waiting 15 seconds before continuing...")
+                  await new Promise((resolve) => setTimeout(resolve, 15000))
+                }
+              }
+
+              // Krátká pauza mezi dávkami svíček
+              await new Promise((resolve) => setTimeout(resolve, 1000))
+            }
+
+            // Update monthly candles
+            try {
+              await processMonthlyCandles(symbol.symbol)
+            } catch (error) {
+              console.error(`Error processing monthly candles for ${symbol.symbol}:`, error)
+
+              // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+              if (error instanceof Error && error.message.includes("Rate limit")) {
+                console.log("Rate limit detected, waiting 15 seconds before continuing...")
+                await new Promise((resolve) => setTimeout(resolve, 15000))
+              }
+            }
+
+            successCount++
+          } catch (fetchError) {
+            console.error(`Error fetching data for ${symbol.symbol}:`, fetchError)
+            errorCount++
+          }
+        } else {
+          // Check if the last data is recent (within the last 2 days)
+          const twoDaysAgo = currentTime - 2 * 24 * 60 * 60 * 1000
+
+          if (lastTimestamp >= twoDaysAgo) {
+            console.log(
+              `Data for ${symbol.symbol} is up to date (last update: ${new Date(lastTimestamp).toISOString()})`,
+            )
+            skippedCount++
+            continue
+          }
+
+          // Check for gaps in the data
+          const twoYearsAgo = new Date()
+          twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2)
+          const twoYearsAgoTimestamp = twoYearsAgo.getTime()
+
+          // Only look for gaps in the last 2 years
+          const startTimestamp = Math.max(twoYearsAgoTimestamp, lastTimestamp)
+
+          let gaps = []
+          try {
+            gaps = await findDataGaps(symbol.symbol, startTimestamp, currentTime)
+          } catch (error) {
+            console.error(`Error finding data gaps for ${symbol.symbol}:`, error)
+
+            // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+            if (error instanceof Error && error.message.includes("Rate limit")) {
+              console.log("Rate limit detected, waiting 15 seconds before continuing...")
+              await new Promise((resolve) => setTimeout(resolve, 15000))
+            }
+
+            // Pokračujeme s prázdným seznamem mezer
+            gaps = []
+          }
+
+          if (gaps.length === 0) {
+            // No gaps, just fetch the latest data
+            console.log(`Fetching latest data for ${symbol.symbol} since ${new Date(lastTimestamp).toISOString()}`)
+
+            // Změna: Použití správného endpointu pro získání svíček
+            const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${lastTimestamp + 1}&limit=10`
+
+            try {
+              const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
+
+              // Transform the data
+              const dailyCandles = data.map((kline: any[]) => ({
+                timestamp: kline[0], // Open time
+                open: kline[1],
+                high: kline[2],
+                low: kline[3],
+                close: kline[4],
+                volume: kline[5],
+                closeTime: kline[6],
+              }))
+
+              // Store daily candles in database
+              for (const candle of dailyCandles) {
                 try {
-                  await processMonthlyCandles(symbol.symbol)
+                  await executeQuery(
+                    `INSERT INTO daily_candles 
+                      (symbol, timestamp, open, high, low, close, volume, close_time) 
+                     VALUES 
+                      ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (symbol, timestamp) 
+                     DO UPDATE SET 
+                      open = $3, high = $4, low = $5, close = $6, volume = $7, close_time = $8`,
+                    [
+                      symbol.symbol,
+                      candle.timestamp,
+                      candle.open,
+                      candle.high,
+                      candle.low,
+                      candle.close,
+                      candle.volume,
+                      candle.closeTime,
+                    ],
+                  )
                 } catch (error) {
-                  console.error(`Error processing monthly candles for ${symbol.symbol}:`, error)
+                  console.error(`Error storing candle for ${symbol.symbol}:`, error)
 
                   // Pokud dojde k chybě rate limitingu, počkáme delší dobu
                   if (error instanceof Error && error.message.includes("Rate limit")) {
@@ -714,97 +868,11 @@ export async function GET() {
                   }
                 }
 
-                successCount++
-              } catch (fetchError) {
-                console.error(`Error fetching latest data for ${symbol.symbol}:`, fetchError)
-                errorCount++
-              }
-            } else {
-              // Fill in the gaps
-              console.log(`Found ${gaps.length} gaps in data for ${symbol.symbol}`)
-
-              for (const gap of gaps) {
-                console.log(
-                  `Filling gap from ${new Date(gap.start).toISOString()} to ${new Date(gap.end).toISOString()}`,
-                )
-
-                // Změna: Použití správného endpointu pro získání svíček
-                const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${gap.start}&endTime=${gap.end}&limit=1000`
-
-                try {
-                  const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
-
-                  // Transform the data
-                  const dailyCandles = data.map((kline: any[]) => ({
-                    timestamp: kline[0], // Open time
-                    open: kline[1],
-                    high: kline[2],
-                    low: kline[3],
-                    close: kline[4],
-                    volume: kline[5],
-                    closeTime: kline[6],
-                  }))
-
-                  // Store daily candles in database - zpracovávám v menších dávkách
-                  const candleBatchSize = 20 // Snížím velikost dávky na 20
-                  for (let i = 0; i < dailyCandles.length; i += candleBatchSize) {
-                    const candleBatch = dailyCandles.slice(i, i + candleBatchSize)
-
-                    try {
-                      for (const candle of candleBatch) {
-                        try {
-                          await executeQuery(
-                            `INSERT INTO daily_candles 
-                              (symbol, timestamp, open, high, low, close, volume, close_time) 
-                             VALUES 
-                              ($1, $2, $3, $4, $5, $6, $7, $8)
-                             ON CONFLICT (symbol, timestamp) 
-                             DO UPDATE SET 
-                              open = $3, high = $4, low = $5, close = $6, volume = $7, close_time = $8`,
-                            [
-                              symbol.symbol,
-                              candle.timestamp,
-                              candle.open,
-                              candle.high,
-                              candle.low,
-                              candle.close,
-                              candle.volume,
-                              candle.closeTime,
-                            ],
-                          )
-                        } catch (candleError) {
-                          console.error(`Error storing candle for ${symbol.symbol}:`, candleError)
-
-                          // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                          if (candleError instanceof Error && candleError.message.includes("Rate limit")) {
-                            console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                            await new Promise((resolve) => setTimeout(resolve, 15000))
-                          }
-                        }
-
-                        // Krátká pauza mezi jednotlivými svíčkami
-                        await new Promise((resolve) => setTimeout(resolve, 100))
-                      }
-                    } catch (batchError) {
-                      console.error(`Error storing candle batch for ${symbol.symbol}:`, batchError)
-
-                      // Pokud dojde k chybě rate limitingu, počkáme delší dobu
-                      if (batchError instanceof Error && batchError.message.includes("Rate limit")) {
-                        console.log("Rate limit detected, waiting 15 seconds before continuing...")
-                        await new Promise((resolve) => setTimeout(resolve, 15000))
-                      }
-                    }
-
-                    // Krátká pauza mezi dávkami svíček
-                    await new Promise((resolve) => setTimeout(resolve, 1000))
-                  }
-                } catch (fetchError) {
-                  console.error(`Error filling gap for ${symbol.symbol}:`, fetchError)
-                  errorCount++
-                }
+                // Krátká pauza mezi jednotlivými svíčkami
+                await new Promise((resolve) => setTimeout(resolve, 100))
               }
 
-              // Update monthly candles after filling all gaps
+              // Update monthly candles
               try {
                 await processMonthlyCandles(symbol.symbol)
               } catch (error) {
@@ -818,37 +886,180 @@ export async function GET() {
               }
 
               successCount++
+            } catch (fetchError) {
+              console.error(`Error fetching latest data for ${symbol.symbol}:`, fetchError)
+              errorCount++
             }
+          } else {
+            // Fill in the gaps
+            console.log(`Found ${gaps.length} gaps in data for ${symbol.symbol}`)
+
+            for (const gap of gaps) {
+              console.log(`Filling gap from ${new Date(gap.start).toISOString()} to ${new Date(gap.end).toISOString()}`)
+
+              // Změna: Použití správného endpointu pro získání svíček
+              const klinesUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol.symbol}&interval=1d&startTime=${gap.start}&endTime=${gap.end}&limit=1000`
+
+              try {
+                const data = await fetchWithRetry(klinesUrl, {}, 5, 2000)
+
+                // Transform the data
+                const dailyCandles = data.map((kline: any[]) => ({
+                  timestamp: kline[0], // Open time
+                  open: kline[1],
+                  high: kline[2],
+                  low: kline[3],
+                  close: kline[4],
+                  volume: kline[5],
+                  closeTime: kline[6],
+                }))
+
+                // Store daily candles in database - zpracovávám v menších dávkách
+                const candleBatchSize = 20 // Snížím velikost dávky na 20
+                for (let i = 0; i < dailyCandles.length; i += candleBatchSize) {
+                  const candleBatch = dailyCandles.slice(i, i + candleBatchSize)
+
+                  try {
+                    for (const candle of candleBatch) {
+                      try {
+                        await executeQuery(
+                          `INSERT INTO daily_candles 
+                            (symbol, timestamp, open, high, low, close, volume, close_time) 
+                           VALUES 
+                            ($1, $2, $3, $4, $5, $6, $7, $8)
+                           ON CONFLICT (symbol, timestamp) 
+                           DO UPDATE SET 
+                            open = $3, high = $4, low = $5, close = $6, volume = $7, close_time = $8`,
+                          [
+                            symbol.symbol,
+                            candle.timestamp,
+                            candle.open,
+                            candle.high,
+                            candle.low,
+                            candle.close,
+                            candle.volume,
+                            candle.closeTime,
+                          ],
+                        )
+                      } catch (candleError) {
+                        console.error(`Error storing candle for ${symbol.symbol}:`, candleError)
+
+                        // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+                        if (candleError instanceof Error && candleError.message.includes("Rate limit")) {
+                          console.log("Rate limit detected, waiting 15 seconds before continuing...")
+                          await new Promise((resolve) => setTimeout(resolve, 15000))
+                        }
+                      }
+
+                      // Krátká pauza mezi jednotlivými svíčkami
+                      await new Promise((resolve) => setTimeout(resolve, 100))
+                    }
+                  } catch (batchError) {
+                    console.error(`Error storing candle batch for ${symbol.symbol}:`, batchError)
+
+                    // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+                    if (batchError instanceof Error && batchError.message.includes("Rate limit")) {
+                      console.log("Rate limit detected, waiting 15 seconds before continuing...")
+                      await new Promise((resolve) => setTimeout(resolve, 15000))
+                    }
+                  }
+
+                  // Krátká pauza mezi dávkami svíček
+                  await new Promise((resolve) => setTimeout(resolve, 1000))
+                }
+              } catch (fetchError) {
+                console.error(`Error filling gap for ${symbol.symbol}:`, fetchError)
+                errorCount++
+              }
+            }
+
+            // Update monthly candles after filling all gaps
+            try {
+              await processMonthlyCandles(symbol.symbol)
+            } catch (error) {
+              console.error(`Error processing monthly candles for ${symbol.symbol}:`, error)
+
+              // Pokud dojde k chybě rate limitingu, počkáme delší dobu
+              if (error instanceof Error && error.message.includes("Rate limit")) {
+                console.log("Rate limit detected, waiting 15 seconds before continuing...")
+                await new Promise((resolve) => setTimeout(resolve, 15000))
+              }
+            }
+
+            successCount++
           }
-        } catch (error) {
-          console.error(`Error processing ${symbol.symbol}:`, error)
-          errorCount++
         }
-
-        // Add a longer delay between symbols to avoid rate limiting
-        console.log(`Waiting 8 seconds before processing next symbol...`) // Zvýšil jsem čekání na 8 sekund
-        await new Promise((resolve) => setTimeout(resolve, 8000))
+      } catch (error) {
+        console.error(`Error processing ${symbol.symbol}:`, error)
+        errorCount++
       }
 
-      // Add a longer delay between batches to avoid rate limiting
-      if (batchIndex < batches - 1) {
-        console.log(`Waiting 15 seconds before processing next batch...`) // Zvýšil jsem čekání na 15 sekund
-        await new Promise((resolve) => setTimeout(resolve, 15000))
-      }
+      // Aktualizujeme stav zpracování po každém symbolu
+      await updateProcessingState({
+        lastProcessedSymbol: symbol.symbol,
+        lastProcessedIndex: i,
+        totalSymbols: symbolsToProcess.length,
+        isProcessing: true,
+        startedAt: new Date(),
+      })
+    }
+
+    // Pokud jsme zpracovali všechny symboly, resetujeme index
+    if (endIndex >= symbolsToProcess.length) {
+      await updateProcessingState({
+        lastProcessedSymbol: null,
+        lastProcessedIndex: -1,
+        totalSymbols: symbolsToProcess.length,
+        isProcessing: false,
+        startedAt: null,
+      })
+    } else {
+      // Jinak jen aktualizujeme stav
+      await updateProcessingState({
+        lastProcessedSymbol: symbolsToProcess[endIndex - 1].symbol,
+        lastProcessedIndex: endIndex - 1,
+        totalSymbols: symbolsToProcess.length,
+        isProcessing: false,
+        startedAt: null,
+      })
     }
 
     return NextResponse.json({
       success: true,
-      message: `Data update completed. Updated ${successCount} symbols successfully. ${errorCount} symbols failed. ${skippedCount} symbols skipped (already up to date).`,
+      message: `Data update in progress. Processed ${endIndex - startIndex} symbols in this batch.`,
+      progress: {
+        processed: endIndex,
+        total: symbolsToProcess.length,
+        percentage: Math.round((endIndex / symbolsToProcess.length) * 100),
+      },
+      stats: {
+        success: successCount,
+        error: errorCount,
+        skipped: skippedCount,
+      },
       initialSetup: isInitialSetup,
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
     console.error("Error in data update process:", error)
+
+    // Resetujeme stav zpracování v případě chyby
+    try {
+      const processingState = await getProcessingState()
+      await updateProcessingState({
+        ...processingState,
+        isProcessing: false,
+        startedAt: null,
+      })
+    } catch (stateError) {
+      console.error("Error resetting processing state:", stateError)
+    }
+
     return NextResponse.json(
       {
         success: false,
         error: "Data update failed. The Binance API may be rate limiting requests.",
+        details: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 },
     )
